@@ -5,6 +5,7 @@ export interface OpenAIToolCall {
 	id: string;
 	type: "function";
 	function: { name: string; arguments: string };
+	provider_specific_fields?: Record<string, unknown>;
 }
 
 /**
