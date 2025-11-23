@@ -25,6 +25,7 @@ export interface OpenAIChatMessage {
 	name?: string;
 	tool_calls?: OpenAIToolCall[];
 	tool_call_id?: string;
+	reasoning_details?: ReasoningDetail[];
 }
 
 /**

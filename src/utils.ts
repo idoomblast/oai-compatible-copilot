@@ -6,6 +6,9 @@ import type {
 	OpenAIToolCall,
 	ChatMessageContent,
 	RetryConfig,
+	ReasoningDetail,
+	ReasoningTextDetail,
+	ReasoningSummaryDetail,
 } from "./types";
 
 const RETRY_MAX_ATTEMPTS = 3;
@@ -184,6 +187,7 @@ export function convertMessages(messages: readonly vscode.LanguageModelChatReque
 		const imageParts: vscode.LanguageModelDataPart[] = [];
 		const toolCalls: OpenAIToolCall[] = [];
 		const toolResults: { callId: string; content: string }[] = [];
+		const reasoningDetails: ReasoningDetail[] = [];
 
 		for (const part of m.content ?? []) {
 			if (part instanceof vscode.LanguageModelTextPart) {
@@ -203,12 +207,50 @@ export function convertMessages(messages: readonly vscode.LanguageModelChatReque
 				const callId = (part as { callId?: string }).callId ?? "";
 				const content = collectToolResultText(part as { content?: ReadonlyArray<unknown> });
 				toolResults.push({ callId, content });
+			} else if (part instanceof vscode.LanguageModelThinkingPart) {
+				const metadata = part.metadata || {};
+				const type = metadata.type || "reasoning.text";
+				const format = metadata.format;
+				const index = metadata.index;
+				const id = (part as any).id;
+
+				if (type === "reasoning.text") {
+					reasoningDetails.push({
+						type: "reasoning.text",
+						text: part.value,
+						signature: metadata.signature,
+						format,
+						index,
+						id,
+					} as ReasoningTextDetail);
+				} else if (type === "reasoning.summary") {
+					reasoningDetails.push({
+						type: "reasoning.summary",
+						summary: part.value,
+						format,
+						index,
+						id,
+					} as ReasoningSummaryDetail);
+				} else if (type === "reasoning.encrypted") {
+					reasoningDetails.push({
+						type: "reasoning.encrypted",
+						data: metadata.data || part.value,
+						format,
+						index,
+						id,
+					} as any);
+				}
 			}
 		}
 
 		let emittedAssistantToolCall = false;
 		if (toolCalls.length > 0) {
-			out.push({ role: "assistant", content: textParts.join("") || undefined, tool_calls: toolCalls });
+			out.push({
+				role: "assistant",
+				content: textParts.join("") || undefined,
+				tool_calls: toolCalls,
+				reasoning_details: reasoningDetails.length > 0 ? reasoningDetails : undefined,
+			});
 			emittedAssistantToolCall = true;
 		}
 
@@ -242,8 +284,19 @@ export function convertMessages(messages: readonly vscode.LanguageModelChatReque
 					out.push({ role, content: textParts.join("\n") });
 				}
 			} else if (role === "system" || (role === "assistant" && !emittedAssistantToolCall)) {
-				out.push({ role, content: textParts.join("\n") });
+				out.push({
+					role,
+					content: textParts.join("\n"),
+					reasoning_details: (role === "assistant" && reasoningDetails.length > 0) ? reasoningDetails : undefined,
+				});
 			}
+		} else if (role === "assistant" && !emittedAssistantToolCall && reasoningDetails.length > 0) {
+			// Case where we have ONLY reasoning details (no text, no tools)
+			out.push({
+				role: "assistant",
+				content: "",
+				reasoning_details: reasoningDetails,
+			});
 		}
 	}
 	return out;

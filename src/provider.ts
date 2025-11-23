@@ -29,17 +29,20 @@ import {
 
 import { prepareLanguageModelChatInformation } from "./provideModel";
 import { prepareTokenCount } from "./provideToken";
+import axios from "axios";
+import { Readable } from "stream";
 
 const MAX_TOOLS_PER_REQUEST = 128;
+const GEMINI_SIG_SEPARATOR = "::gemini_sig::";
 
 /**
  * VS Code Chat provider backed by Hugging Face Inference Providers.
  */
 export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 	/**
-		 * Buffer for assembling streamed tool calls by index.
-		 * UPDATED: Added thoughtSignature to the buffer structure.
-		 */
+	 * Buffer for assembling streamed tool calls by index.
+	 * UPDATED: Added thoughtSignature to the buffer structure.
+	 */
 	private _toolCallBuffers: Map<number, { id?: string; name?: string; args: string; thoughtSignature?: string }> = new Map();
 
 	/** Indices for which a tool call has been fully emitted. */
@@ -70,7 +73,6 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 	private _currentThinkingId: string | null = null;
 	private _currentReasoningSignature: string | null = null;
 	private _currentResponseReasoningDetails: ReasoningDetail[] = [];
-	private _reasoningDetailsMap: Map<string, ReasoningDetail[]> = new Map();
 
 	/** Track last request completion time for delay calculation. */
 	private _lastRequestTime: number | null = null;
@@ -161,9 +163,6 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			const openaiMessages = convertMessages(messages);
 			validateRequest(messages);
 
-			// Reconstruct reasoning details from history to handle session restoration
-			const reconstructedDetails = this.reconstructReasoningDetails(messages);
-
 			const userModels = config.get<HFModelItem[]>("oaicopilot.models", []);
 			const parsedModelId = parseModelId(model.id);
 
@@ -196,48 +195,55 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			// ---------------------------------------------------------
 			// IMPROVED GEMINI-3-PRO THOUGHT SIGNATURE INJECTION
 			// ---------------------------------------------------------
-			// We now encode the signature into the ID (see processStreamingResponse).
-			// Here we decode it, restore the original ID, and inject the signature.
-			// We also inject full reasoning_details if we captured them.
-			const SIG_SEPARATOR = "::gemini_sig::";
+			// We iterate through the converted OpenAI messages to fix up IDs and inject metadata.
 
 			for (const msg of openaiMessages) {
-				if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
-					for (const tc of msg.tool_calls) {
-						let currentId = tc.id;
-						const originalId = currentId;
-						let signatureFromId: string | undefined;
+				// 1. Handle Assistant Messages (Tool Calls & Reasoning)
+				if (msg.role === "assistant") {
+					if (Array.isArray(msg.tool_calls)) {
+						for (const tc of msg.tool_calls) {
+							let currentId = tc.id;
 
-						if (typeof currentId === "string" && currentId.includes(SIG_SEPARATOR)) {
-							const [realId, signature] = currentId.split(SIG_SEPARATOR);
-							if (realId && signature) {
-								tc.id = realId;
-								currentId = realId;
-								signatureFromId = signature;
+							// Check for separator in ID
+							if (typeof currentId === "string" && currentId.includes(GEMINI_SIG_SEPARATOR)) {
+								const parts = currentId.split(GEMINI_SIG_SEPARATOR);
+								const realId = parts[0];
+								const signature = parts[1];
 
-								if (!(tc as any).provider_specific_fields) {
-									(tc as any).provider_specific_fields = {};
+								if (realId && signature) {
+									// Update the ID to the clean version
+									tc.id = realId;
+									currentId = realId;
+
+									// CRITICAL: Inject provider_specific_fields for OpenRouter
+									if (!(tc as any).provider_specific_fields) {
+										(tc as any).provider_specific_fields = {};
+									}
+									(tc as any).provider_specific_fields.thought_signature = signature;
 								}
-								(tc as any).provider_specific_fields.thought_signature = signature;
 							}
-						}
 
-						// Check if we have captured reasoning details for this tool call ID
-						let details = this._reasoningDetailsMap.get(currentId);
-						if (!details && reconstructedDetails.has(originalId)) {
-							details = reconstructedDetails.get(originalId);
-						}
-
-						if (details && details.length > 0) {
-							// Inject reasoning_details into the message
-							if (!(msg as any).reasoning_details) {
-								(msg as any).reasoning_details = details;
+							// If we have reasoning_details on the message, try to find signature there too
+							// and inject it if missing from ID
+							if (msg.reasoning_details && !(tc as any).provider_specific_fields?.thought_signature) {
+								const textDetail = msg.reasoning_details.find(
+									(d) => d.type === "reasoning.text" && (d as ReasoningTextDetail).signature
+								) as ReasoningTextDetail | undefined;
+								if (textDetail && textDetail.signature) {
+									if (!(tc as any).provider_specific_fields) {
+										(tc as any).provider_specific_fields = {};
+									}
+									(tc as any).provider_specific_fields.thought_signature = textDetail.signature;
+								}
 							}
 						}
 					}
-				} else if (msg.role === "tool" && typeof msg.tool_call_id === "string") {
-					if (msg.tool_call_id.includes(SIG_SEPARATOR)) {
-						const [realId] = msg.tool_call_id.split(SIG_SEPARATOR);
+				}
+				// 2. Handle Tool/Function Response Messages
+				else if (msg.role === "tool" && typeof msg.tool_call_id === "string") {
+					// The tool response must verify against the stripped ID
+					if (msg.tool_call_id.includes(GEMINI_SIG_SEPARATOR)) {
+						const [realId] = msg.tool_call_id.split(GEMINI_SIG_SEPARATOR);
 						if (realId) {
 							msg.tool_call_id = realId;
 						}
@@ -248,11 +254,11 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			// ---------------------------------------------------------
 
 			if (Array.isArray(requestBody.messages)) {
+				// Debug log to verify structure before sending
 				const filteredMessages = requestBody.messages.filter(
 					(msg: any) => msg.role === "assistant" || msg.role === "model"
 				);
-				const logBody = { ...requestBody, messages: filteredMessages };
-				//console.log("[OAI Compatible Model Provider] RequestBody assistant debug:", JSON.stringify(logBody));
+				// console.log("[OAI Compatible Model Provider] RequestBody assistant debug:", JSON.stringify(filteredMessages, null, 2));
 			}
 
 			const BASE_URL = um?.baseUrl || config.get<string>("oaicopilot.baseUrl", "");
@@ -270,23 +276,55 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 
 			const requestHeaders = um?.headers ? { ...defaultHeaders, ...um.headers } : defaultHeaders;
 
+			const proxyUrl = config.get<string>("oaicopilot.proxy", "");
+			let axiosProxy: any = false;
+			if (proxyUrl) {
+				try {
+					const parsedUrl = new URL(proxyUrl);
+					axiosProxy = {
+						protocol: parsedUrl.protocol.replace(':', ''),
+						host: parsedUrl.hostname,
+						port: parsedUrl.port ? parseInt(parsedUrl.port) : (parsedUrl.protocol === 'https:' ? 443 : 80)
+					};
+					if (parsedUrl.username || parsedUrl.password) {
+						axiosProxy.auth = {
+							username: parsedUrl.username,
+							password: parsedUrl.password
+						};
+					}
+				} catch (e) {
+					console.error("Invalid proxy URL", e);
+				}
+			}
+
 			const response = await executeWithRetry(
 				async () => {
-					const res = await fetch(`${BASE_URL.replace(/\/+$/, "")}/chat/completions`, {
-						method: "POST",
+					const url = `${BASE_URL.replace(/\/+$/, "")}/chat/completions`;
+					const res = await axios.post(url, requestBody, {
 						headers: requestHeaders,
-						body: JSON.stringify(requestBody),
-					});
+						responseType: "stream",
+						proxy: axiosProxy,
+						validateStatus: () => true,
+						rejectUnauthorized: false,
+					} as any);
 
-					if (!res.ok) {
-						const errorText = await res.text();
+					if (res.status < 200 || res.status >= 300) {
+						const stream = res.data;
+						const chunks: Buffer[] = [];
+						for await (const chunk of stream) {
+							chunks.push(Buffer.from(chunk));
+						}
+						const errorText = Buffer.concat(chunks).toString("utf-8");
 						console.error("[OAI Compatible Model Provider] API error", errorText);
 						throw new Error(
 							`API error: [${res.status}] ${res.statusText}${errorText ? `\n${errorText}` : ""}`
 						);
 					}
 
-					return res;
+					return {
+						body: Readable.toWeb(res.data) as ReadableStream<Uint8Array>,
+						ok: true,
+					};
 				},
 				retryConfig,
 				token
@@ -499,17 +537,9 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 				const sortedDetails = details.sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
 
 				for (const detail of sortedDetails) {
-					// Merge logic for streaming reconstruction
-					const existingIdx = this._currentResponseReasoningDetails.findIndex(d => d.index === detail.index);
-					if (existingIdx !== -1) {
-						const existing = this._currentResponseReasoningDetails[existingIdx];
-						if (existing.type === 'reasoning.text' && detail.type === 'reasoning.text') {
-							existing.text += detail.text;
-							if (detail.signature) existing.signature = detail.signature;
-						}
-					} else {
-						this._currentResponseReasoningDetails.push({ ...detail });
-					}
+					// Collect all reasoning_details chunks as they arrive.
+					// We do NOT merge them, to preserve the exact sequence of chunks for the API.
+					this._currentResponseReasoningDetails.push({ ...detail });
 
 					let extractedText = "";
 					if (detail.type === "reasoning.summary") {
@@ -521,6 +551,9 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 						}
 					} else if (detail.type === "reasoning.encrypted") {
 						extractedText = "[REDACTED]";
+						if ((detail as any).data) {
+							this._currentReasoningSignature = (detail as any).data;
+						}
 					} else {
 						extractedText = JSON.stringify(detail);
 					}
@@ -613,14 +646,8 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 				}
 
 				// Capture full reasoning details for map persistence
-				if (buf.id && this._currentResponseReasoningDetails.length > 0) {
-					if (this._reasoningDetailsMap.size > 100) {
-						const firstKey = this._reasoningDetailsMap.keys().next().value;
-						if (firstKey) this._reasoningDetailsMap.delete(firstKey);
-					}
-					this._reasoningDetailsMap.set(buf.id, JSON.parse(JSON.stringify(this._currentResponseReasoningDetails)));
-				}
-				// ---------------------------------------------------------
+				// We rely on the ID potentially changing to include the signature later in tryEmitBufferedToolCall
+				// but here we store it raw.
 
 				this._toolCallBuffers.set(idx, buf);
 				await this.tryEmitBufferedToolCall(idx, progress);
@@ -694,7 +721,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		// Encode signature into ID for persistence
 		let finalId = id;
 		if (buf.thoughtSignature) {
-			finalId = `${id}::gemini_sig::${buf.thoughtSignature}`;
+			finalId = `${id}${GEMINI_SIG_SEPARATOR}${buf.thoughtSignature}`;
 		}
 
 		const parameters = canParse.value;
@@ -733,7 +760,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			// Encode signature into ID for persistence
 			let finalId = id;
 			if (buf.thoughtSignature) {
-				finalId = `${id}::gemini_sig::${buf.thoughtSignature}`;
+				finalId = `${id}${GEMINI_SIG_SEPARATOR}${buf.thoughtSignature}`;
 			}
 
 			try {
@@ -795,79 +822,5 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		}
 
 		return { emittedAny };
-	}
-
-	private reconstructReasoningDetails(messages: readonly LanguageModelChatRequestMessage[]): Map<string, ReasoningDetail[]> {
-		const map = new Map<string, ReasoningDetail[]>();
-
-		for (const m of messages) {
-			if (m.role !== vscode.LanguageModelChatMessageRole.Assistant) continue;
-
-			const thinkingParts = m.content.filter((p) => p instanceof vscode.LanguageModelThinkingPart);
-			const toolCallParts = m.content.filter((p) => p instanceof vscode.LanguageModelToolCallPart);
-
-			if (toolCallParts.length === 0 || thinkingParts.length === 0) continue;
-
-			const details: ReasoningDetail[] = [];
-			for (const p of thinkingParts) {
-				if (!p.metadata) continue;
-
-				const type = p.metadata.type;
-				const format = p.metadata.format;
-				const index = p.metadata.index;
-				const id = p.id;
-
-				if (!type) continue;
-
-				if (type === "reasoning.text") {
-					let signature = p.metadata.signature;
-					// Fallback: try to find signature in tool call IDs if not in metadata
-					if (!signature) {
-						for (const tc of toolCallParts) {
-							if (tc.callId && tc.callId.includes("::gemini_sig::")) {
-								signature = tc.callId.split("::gemini_sig::")[1];
-								if (signature) break;
-							}
-						}
-					}
-
-					details.push({
-						type: "reasoning.text",
-						text: Array.isArray(p.value) ? p.value.join("") : p.value,
-						signature,
-						format,
-						index,
-						id,
-					} as ReasoningTextDetail);
-				} else if (type === "reasoning.summary") {
-					details.push({
-						type: "reasoning.summary",
-						summary: Array.isArray(p.value) ? p.value.join("") : p.value,
-						format,
-						index,
-						id,
-					} as ReasoningSummaryDetail);
-				} else if (type === "reasoning.encrypted") {
-					if (p.metadata.data) {
-						details.push({
-							type: "reasoning.encrypted",
-							data: p.metadata.data,
-							format,
-							index,
-							id,
-						} as any);
-					}
-				}
-			}
-
-			if (details.length > 0) {
-				for (const tc of toolCallParts) {
-					if (tc.callId) {
-						map.set(tc.callId, details);
-					}
-				}
-			}
-		}
-		return map;
 	}
 }
