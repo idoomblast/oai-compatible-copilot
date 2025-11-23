@@ -7,6 +7,8 @@ import {
 	ProvideLanguageModelChatResponseOptions,
 	LanguageModelResponsePart2,
 	Progress,
+	LanguageModelToolCallPart,
+	LanguageModelDataPart,
 } from "vscode";
 
 import type {
@@ -15,6 +17,7 @@ import type {
 	ReasoningSummaryDetail,
 	ReasoningTextDetail,
 	ReasoningConfig,
+	OpenAIToolCall,
 } from "./types";
 
 import {
@@ -25,6 +28,7 @@ import {
 	parseModelId,
 	createRetryConfig,
 	executeWithRetry,
+	shortHash,
 } from "./utils";
 
 import { prepareLanguageModelChatInformation } from "./provideModel";
@@ -32,55 +36,26 @@ import { prepareTokenCount } from "./provideToken";
 import axios from "axios";
 import { Readable } from "stream";
 
-const MAX_TOOLS_PER_REQUEST = 128;
-const GEMINI_SIG_SEPARATOR = "::gemini_sig::";
+// REDUCED LIMIT to prevent "Budget Exceeded" crash
+const MAX_TOOLS_PER_REQUEST = 40;
 
-/**
- * VS Code Chat provider backed by Hugging Face Inference Providers.
- */
 export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
-	/**
-	 * Buffer for assembling streamed tool calls by index.
-	 * UPDATED: Added thoughtSignature to the buffer structure.
-	 */
-	private _toolCallBuffers: Map<number, { id?: string; name?: string; args: string; thoughtSignature?: string }> = new Map();
-
-	/** Indices for which a tool call has been fully emitted. */
+	private readonly _toolCallBuffers: Map<string, {
+        toolCall: OpenAIToolCall;
+    }> = new Map();
 	private _completedToolCallIndices = new Set<number>();
-
-	/** Track if we emitted any assistant text before seeing tool calls (SSE-like begin-tool-calls hint). */
 	private _hasEmittedAssistantText = false;
-
-	/** Track if we emitted the begin-tool-calls whitespace flush. */
 	private _emittedBeginToolCallsHint = false;
-
-	private _textToolActive:
-		| undefined
-		| {
-			name?: string;
-			index?: number;
-			argBuffer: string;
-			emitted?: boolean;
-		};
+	private _textToolActive: undefined | { name?: string; index?: number; argBuffer: string; emitted?: boolean };
 	private _emittedTextToolCallKeys = new Set<string>();
 	private _emittedTextToolCallIds = new Set<string>();
-
-	// XML think block parsing state
 	private _xmlThinkActive = false;
 	private _xmlThinkDetectionAttempted = false;
-
-	// Thinking content state management
 	private _currentThinkingId: string | null = null;
-	private _currentReasoningSignature: string | null = null;
 	private _currentResponseReasoningDetails: ReasoningDetail[] = [];
-
-	/** Track last request completion time for delay calculation. */
 	private _lastRequestTime: number | null = null;
+	private _reasoningTextBuffer = "";
 
-	/**
-	 * Create a provider using the given secret storage for the API key.
-	 * @param secrets VS Code secret storage.
-	 */
 	constructor(
 		private readonly secrets: vscode.SecretStorage,
 		private readonly userAgent: string
@@ -113,6 +88,9 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		progress: Progress<LanguageModelResponsePart2>,
 		token: CancellationToken
 	): Promise<void> {
+		console.log(`[OAI Provider] Start request for model: ${model.id}`);
+
+		// Reset state
 		this._toolCallBuffers.clear();
 		this._completedToolCallIndices.clear();
 		this._hasEmittedAssistantText = false;
@@ -123,41 +101,40 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		this._xmlThinkActive = false;
 		this._xmlThinkDetectionAttempted = false;
 		this._currentThinkingId = null;
-		this._currentReasoningSignature = null;
 		this._currentResponseReasoningDetails = [];
+		this._reasoningTextBuffer = "";
 
 		const config = vscode.workspace.getConfiguration();
-		const delayMs = config.get<number>("oaicopilot.delay", 0);
 
+		// 1. Handle Delay
+		const delayMs = config.get<number>("oaicopilot.delay", 0);
 		if (delayMs > 0 && this._lastRequestTime !== null) {
 			const elapsed = Date.now() - this._lastRequestTime;
 			if (elapsed < delayMs) {
-				const remainingDelay = delayMs - elapsed;
-				await new Promise<void>((resolve) => {
-					const timeout = setTimeout(() => {
-						clearTimeout(timeout);
-						resolve();
-					}, remainingDelay);
-				});
+				await new Promise((resolve) => setTimeout(resolve, delayMs - elapsed));
 			}
 		}
 
 		let requestBody: Record<string, unknown> | undefined;
+
+		// wrapper to catch progress errors
 		const trackingProgress: Progress<LanguageModelResponsePart2> = {
 			report: (part) => {
 				try {
 					progress.report(part);
 				} catch (e) {
-					console.error("[OAI Compatible Model Provider] Progress.report failed", {
-						modelId: model.id,
-						error: e instanceof Error ? { name: e.name, message: e.message } : String(e),
-					});
+					// This often happens if the renderer crashed previously
+					console.error("[OAI Provider] Progress report failed:", e);
 				}
 			},
 		};
+
 		try {
-			if (options.tools && options.tools.length > MAX_TOOLS_PER_REQUEST) {
-				throw new Error(`Cannot have more than ${MAX_TOOLS_PER_REQUEST} tools per request.`);
+			// 2. SAFETY CHECK: Limit Tools to prevent "No lowest priority node" crash
+			let safeOptions = { ...options };
+			if (safeOptions.tools && safeOptions.tools.length > MAX_TOOLS_PER_REQUEST) {
+				console.warn(`[OAI Provider] Too many tools (${safeOptions.tools.length}). Truncating to ${MAX_TOOLS_PER_REQUEST}.`);
+				safeOptions.tools = safeOptions.tools.slice(0, MAX_TOOLS_PER_REQUEST);
 			}
 
 			const openaiMessages = convertMessages(messages);
@@ -190,90 +167,19 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 				stream: true,
 				stream_options: { include_usage: true },
 			};
-			requestBody = this.prepareRequestBody(requestBody, um, options);
 
-			// ---------------------------------------------------------
-			// IMPROVED GEMINI-3-PRO THOUGHT SIGNATURE INJECTION
-			// ---------------------------------------------------------
-			// We iterate through the converted OpenAI messages to fix up IDs and inject metadata.
-
-			for (const msg of openaiMessages) {
-				// 1. Handle Assistant Messages (Tool Calls & Reasoning)
-				if (msg.role === "assistant") {
-					if (Array.isArray(msg.tool_calls)) {
-						for (const tc of msg.tool_calls) {
-							let currentId = tc.id;
-
-							// Check for separator in ID
-							if (typeof currentId === "string" && currentId.includes(GEMINI_SIG_SEPARATOR)) {
-								const parts = currentId.split(GEMINI_SIG_SEPARATOR);
-								const realId = parts[0];
-								const signature = parts[1];
-
-								if (realId && signature) {
-									// Update the ID to the clean version
-									tc.id = realId;
-									currentId = realId;
-
-									// CRITICAL: Inject provider_specific_fields for OpenRouter
-									if (!(tc as any).provider_specific_fields) {
-										(tc as any).provider_specific_fields = {};
-									}
-									(tc as any).provider_specific_fields.thought_signature = signature;
-								}
-							}
-
-							// If we have reasoning_details on the message, try to find signature there too
-							// and inject it if missing from ID
-							if (msg.reasoning_details && !(tc as any).provider_specific_fields?.thought_signature) {
-								const textDetail = msg.reasoning_details.find(
-									(d) => d.type === "reasoning.text" && (d as ReasoningTextDetail).signature
-								) as ReasoningTextDetail | undefined;
-								if (textDetail && textDetail.signature) {
-									if (!(tc as any).provider_specific_fields) {
-										(tc as any).provider_specific_fields = {};
-									}
-									(tc as any).provider_specific_fields.thought_signature = textDetail.signature;
-								}
-							}
-						}
-					}
-				}
-				// 2. Handle Tool/Function Response Messages
-				else if (msg.role === "tool" && typeof msg.tool_call_id === "string") {
-					// The tool response must verify against the stripped ID
-					if (msg.tool_call_id.includes(GEMINI_SIG_SEPARATOR)) {
-						const [realId] = msg.tool_call_id.split(GEMINI_SIG_SEPARATOR);
-						if (realId) {
-							msg.tool_call_id = realId;
-						}
-					}
-				}
-			}
-
-			// ---------------------------------------------------------
-
-			if (Array.isArray(requestBody.messages)) {
-				// Debug log to verify structure before sending
-				const filteredMessages = requestBody.messages.filter(
-					(msg: any) => msg.role === "assistant" || msg.role === "model"
-				);
-				// console.log("[OAI Compatible Model Provider] RequestBody assistant debug:", JSON.stringify(filteredMessages, null, 2));
-			}
+			// Use safeOptions (with truncated tools)
+			requestBody = this.prepareRequestBody(requestBody, um, safeOptions);
 
 			const BASE_URL = um?.baseUrl || config.get<string>("oaicopilot.baseUrl", "");
-			if (!BASE_URL || !BASE_URL.startsWith("http")) {
-				throw new Error(`Invalid base URL configuration.`);
-			}
+			if (!BASE_URL || !BASE_URL.startsWith("http")) throw new Error(`Invalid base URL.`);
 
 			const retryConfig = createRetryConfig();
-
 			const defaultHeaders: Record<string, string> = {
 				Authorization: `Bearer ${modelApiKey}`,
 				"Content-Type": "application/json",
 				"User-Agent": this.userAgent,
 			};
-
 			const requestHeaders = um?.headers ? { ...defaultHeaders, ...um.headers } : defaultHeaders;
 
 			const proxyUrl = config.get<string>("oaicopilot.proxy", "");
@@ -287,16 +193,14 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 						port: parsedUrl.port ? parseInt(parsedUrl.port) : (parsedUrl.protocol === 'https:' ? 443 : 80)
 					};
 					if (parsedUrl.username || parsedUrl.password) {
-						axiosProxy.auth = {
-							username: parsedUrl.username,
-							password: parsedUrl.password
-						};
+						axiosProxy.auth = { username: parsedUrl.username, password: parsedUrl.password };
 					}
 				} catch (e) {
 					console.error("Invalid proxy URL", e);
 				}
 			}
 
+			// Execute Request
 			const response = await executeWithRetry(
 				async () => {
 					const url = `${BASE_URL.replace(/\/+$/, "")}/chat/completions`;
@@ -311,55 +215,36 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 					if (res.status < 200 || res.status >= 300) {
 						const stream = res.data;
 						const chunks: Buffer[] = [];
-						for await (const chunk of stream) {
-							chunks.push(Buffer.from(chunk));
-						}
+						for await (const chunk of stream) chunks.push(Buffer.from(chunk));
 						const errorText = Buffer.concat(chunks).toString("utf-8");
-						console.error("[OAI Compatible Model Provider] API error", errorText);
-						throw new Error(
-							`API error: [${res.status}] ${res.statusText}${errorText ? `\n${errorText}` : ""}`
-						);
+						throw new Error(`API error: [${res.status}] ${res.statusText} ${errorText}`);
 					}
-
-					return {
-						body: Readable.toWeb(res.data) as ReadableStream<Uint8Array>,
-						ok: true,
-					};
+					return { body: Readable.toWeb(res.data) as ReadableStream<Uint8Array>, ok: true };
 				},
 				retryConfig,
 				token
 			);
 
-			if (!response.body) {
-				throw new Error("No response body from API");
-			}
+			if (!response.body) throw new Error("No response body");
 			await this.processStreamingResponse(response.body, trackingProgress, token);
+
 		} catch (err) {
-			console.error("[OAI Compatible Model Provider] Chat request failed", err);
+			console.error("[OAI Provider] Chat request failed", err);
 			throw err;
 		} finally {
 			this._lastRequestTime = Date.now();
+			console.log("[OAI Provider] Request finished");
 		}
 	}
 
-	private prepareRequestBody(
-		rb: Record<string, unknown>,
-		um: HFModelItem | undefined,
-		options: ProvideLanguageModelChatResponseOptions
-	) {
+	private prepareRequestBody(rb: Record<string, unknown>, um: HFModelItem | undefined, options: ProvideLanguageModelChatResponseOptions) {
 		const oTemperature = options.modelOptions?.temperature ?? 0;
-		const temperature = um?.temperature ?? oTemperature;
-		rb.temperature = temperature;
-
+		rb.temperature = um?.temperature ?? oTemperature;
 		const oTopP = options.modelOptions?.top_p ?? 1;
-		const topP = um?.top_p ?? oTopP;
-		rb.top_p = topP;
+		rb.top_p = um?.top_p ?? oTopP;
 
-		if (um && um.temperature === null) delete rb.temperature;
-		if (um && um.top_p === null) delete rb.top_p;
-
-		if (um?.max_tokens !== undefined) rb.max_tokens = um.max_tokens;
-		if (um?.max_completion_tokens !== undefined) rb.max_completion_tokens = um.max_completion_tokens;
+		if (um?.max_tokens) rb.max_tokens = um.max_tokens;
+		if (um?.max_completion_tokens) rb.max_completion_tokens = um.max_completion_tokens;
 		if (um?.reasoning_effort !== undefined) rb.reasoning_effort = um.reasoning_effort;
 
 		const enableThinking = um?.enable_thinking;
@@ -399,6 +284,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			}
 		}
 
+		// Use the possibly-truncated tools from options
 		const toolConfig = convertTools(options);
 		if (toolConfig.tools) rb.tools = toolConfig.tools;
 		if (toolConfig.tool_choice) rb.tool_choice = toolConfig.tool_choice;
@@ -418,7 +304,8 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		return rb;
 	}
 
-	private async ensureApiKey(useGenericKey: boolean, provider?: string): Promise<string | undefined> {
+	// ... (Keep existing ensureApiKey) ...
+    private async ensureApiKey(useGenericKey: boolean, provider?: string): Promise<string | undefined> {
 		let apiKey: string | undefined;
 		if (provider && provider.trim() !== "") {
 			const normalizedProvider = provider.toLowerCase();
@@ -480,35 +367,23 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 					if (!line.startsWith("data:")) continue;
 					const data = line.slice(5).trim();
 					if (data === "[DONE]") {
-						await this.flushToolCallBuffers(progress, false);
+						await this.flushToolCallBuffers(progress);
 						await this.flushActiveTextToolCall(progress);
+						await this.flushReasoningBuffer(progress);
 						continue;
 					}
-
 					try {
-						const parsed = JSON.parse(data);
-						await this.processDelta(parsed, progress);
-					} catch {
-						// ignore malformed
-					}
+						await this.processDelta(JSON.parse(data), progress);
+					} catch (e) { }
 				}
 			}
 		} finally {
 			reader.releaseLock();
+			// Clean up
 			this._toolCallBuffers.clear();
-			this._completedToolCallIndices.clear();
-			this._hasEmittedAssistantText = false;
-			this._emittedBeginToolCallsHint = false;
-			this._textToolActive = undefined;
-			this._emittedTextToolCallKeys.clear();
-			this._xmlThinkActive = false;
-			this._xmlThinkDetectionAttempted = false;
 			this._currentThinkingId = null;
+			this._reasoningTextBuffer = "";
 		}
-	}
-
-	private generateThinkingId(): string {
-		return `thinking_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 	}
 
 	private async processDelta(
@@ -538,38 +413,59 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 				const sortedDetails = details.sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
 
 				for (const detail of sortedDetails) {
-					// Collect all reasoning_details chunks as they arrive.
-					// We do NOT merge them, to preserve the exact sequence of chunks for the API.
 					this._currentResponseReasoningDetails.push({ ...detail });
 
-					let extractedText = "";
+					let text = "";
+					let signature: string | null = null;
+					let isSimpleText = false;
+
 					if (detail.type === "reasoning.summary") {
-						extractedText = (detail as ReasoningSummaryDetail).summary;
+						text = (detail as ReasoningSummaryDetail).summary;
 					} else if (detail.type === "reasoning.text") {
-						extractedText = (detail as ReasoningTextDetail).text;
+						text = (detail as ReasoningTextDetail).text;
 						if ((detail as ReasoningTextDetail).signature) {
-							this._currentReasoningSignature = (detail as ReasoningTextDetail).signature || null;
+							signature = (detail as ReasoningTextDetail).signature || null;
 						}
+						isSimpleText = true;
 					} else if (detail.type === "reasoning.encrypted") {
-						extractedText = "[REDACTED]";
+						text = "[REDACTED]";
 						if ((detail as any).data) {
-							this._currentReasoningSignature = (detail as any).data;
+							signature = (detail as any).data;
 						}
 					} else {
-						extractedText = JSON.stringify(detail);
+						text = JSON.stringify(detail);
 					}
 
-					if (extractedText) {
-						if (!this._currentThinkingId) this._currentThinkingId = this.generateThinkingId();
-						const metadata: Record<string, any> = { format: detail.format, type: detail.type, index: detail.index };
-						if (detail.type === "reasoning.text" && (detail as ReasoningTextDetail).signature) {
-							metadata.signature = (detail as ReasoningTextDetail).signature;
+					// Coalescing Logic:
+					// If it's simple text without a signature, buffer it.
+					if (isSimpleText && !signature) {
+						this._reasoningTextBuffer += text;
+						// Flush if buffer gets too large to keep UI responsive
+						if (this._reasoningTextBuffer.length > 4000) {
+							await this.flushReasoningBuffer(progress);
+							emitted = true;
 						}
-						if (detail.type === "reasoning.encrypted" && (detail as any).data) {
-							metadata.data = (detail as any).data;
+					} else {
+						// It has a signature or is a special type.
+						// 1. Flush any pending buffer first.
+						if (this._reasoningTextBuffer.length > 0) {
+							await this.flushReasoningBuffer(progress);
+							emitted = true;
 						}
-						progress.report(new vscode.LanguageModelThinkingPart(extractedText, this._currentThinkingId, metadata));
-						emitted = true;
+
+						// 2. Emit this chunk immediately with its metadata/signature.
+						if (text || signature) {
+							if (!this._currentThinkingId) this._currentThinkingId = this.generateThinkingId();
+							const metadata: Record<string, any> = { format: detail.format, type: detail.type, index: detail.index };
+
+							// IMPORTANT: Include signature in metadata so it can be round-tripped in history.
+							if (signature) {
+								metadata.signature = signature;
+							}
+
+							progress.report(new vscode.LanguageModelThinkingPart(text, this._currentThinkingId, metadata));
+							emitted = true;
+						}
 					}
 				}
 				maybeThinking = null;
@@ -618,67 +514,94 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			}
 		}
 
-		// Process Tool Calls
 		if (deltaObj?.tool_calls) {
-			const toolCalls = deltaObj.tool_calls as Array<Record<string, unknown>>;
+			const { tool_calls } = deltaObj;
+			if (tool_calls) {
+				for (const tc of tool_calls as any[]) {
+					if (!tc) continue;
+					const { id, function: func, "x-provider": providerFields } = tc;
+					let buf = this._toolCallBuffers.get(id ?? "");
+					if (!buf) {
+						buf = { toolCall: { id: id ?? "", type: "function", function: { name: "", arguments: "" } } };
+						if (id) {
+							this._toolCallBuffers.set(id, buf);
+						}
+					}
+					if (func?.name) buf.toolCall.function.name += func.name;
+					if (func?.arguments) buf.toolCall.function.arguments += func.arguments;
 
-			if (!this._emittedBeginToolCallsHint && this._hasEmittedAssistantText && toolCalls.length > 0) {
-				progress.report(new vscode.LanguageModelTextPart(" "));
-				this._emittedBeginToolCallsHint = true;
-			}
-
-			for (const tc of toolCalls) {
-				const idx = (tc.index as number) ?? 0;
-				if (this._completedToolCallIndices.has(idx)) continue;
-
-				const buf = this._toolCallBuffers.get(idx) ?? { args: "" };
-
-				if (tc.id && typeof tc.id === "string") buf.id = tc.id as string;
-				const func = tc.function as Record<string, unknown> | undefined;
-				if (func?.name && typeof func.name === "string") buf.name = func.name as string;
-				if (typeof func?.arguments === "string") buf.args += func.arguments as string;
-
-				// ---------------------------------------------------------
-				// CAPTURE THOUGHT SIGNATURE from stream
-				// ---------------------------------------------------------
-				const providerFields = tc.provider_specific_fields as Record<string, unknown> | undefined;
-				if (providerFields && typeof providerFields.thought_signature === "string") {
-					buf.thoughtSignature = providerFields.thought_signature;
-				} else if (this._currentReasoningSignature) {
-					buf.thoughtSignature = this._currentReasoningSignature;
+					if (providerFields?.thought) {
+						progress.report(new vscode.LanguageModelToolCallPart(id ?? "", id ?? "", { thought: providerFields.thought }));
+						emitted = true;
+					}
 				}
-
-				// Capture full reasoning details for map persistence
-				// We rely on the ID potentially changing to include the signature later in tryEmitBufferedToolCall
-				// but here we store it raw.
-
-				this._toolCallBuffers.set(idx, buf);
-				await this.tryEmitBufferedToolCall(idx, progress);
 			}
 		}
 
+
+
 		const finish = (choice.finish_reason as string | undefined) ?? undefined;
 		if (finish === "tool_calls" || finish === "stop") {
-			await this.flushToolCallBuffers(progress, true);
+			await this.flushToolCallBuffers(progress);
 		}
 		return emitted;
 	}
 
-	private processTextContent(
+	private processXmlThinkBlocks(
 		input: string,
 		progress: Progress<LanguageModelResponsePart2>
-	): { emittedText: boolean; emittedAny: boolean } {
-		let emittedText = false;
+	): { emittedAny: boolean; remainingText: string } {
+		const THINK_START = "<think>";
+		const THINK_END = "</think>";
+		let data = input;
 		let emittedAny = false;
-		const textToEmit = input;
-		if (textToEmit && textToEmit.length > 0) {
-			progress.report(new vscode.LanguageModelTextPart(textToEmit));
-			emittedText = true;
-			emittedAny = true;
-		}
-		return { emittedText, emittedAny };
-	}
+		let remainingText = "";
 
+        // Optimization for simple text
+        if (this._xmlThinkDetectionAttempted && !this._xmlThinkActive) {
+            return { emittedAny: false, remainingText: input };
+        }
+
+		while (data.length > 0) {
+			if (!this._xmlThinkActive) {
+				const startIdx = data.indexOf(THINK_START);
+				if (startIdx === -1) {
+                    this._xmlThinkDetectionAttempted = true;
+					remainingText += data;
+					data = "";
+					break;
+				}
+
+				remainingText += data.slice(0, startIdx);
+				this._xmlThinkActive = true;
+				this._currentThinkingId = this.generateThinkingId();
+				data = data.slice(startIdx + THINK_START.length);
+				continue;
+			}
+
+			const endIdx = data.indexOf(THINK_END);
+			if (endIdx === -1) {
+                if(!this._currentThinkingId) this._currentThinkingId = this.generateThinkingId();
+				progress.report(new vscode.LanguageModelThinkingPart(data, this._currentThinkingId));
+				emittedAny = true;
+				data = "";
+				break;
+			}
+
+			const content = data.slice(0, endIdx);
+            if(!this._currentThinkingId) this._currentThinkingId = this.generateThinkingId();
+			progress.report(new vscode.LanguageModelThinkingPart(content, this._currentThinkingId));
+			emittedAny = true;
+
+			this._xmlThinkActive = false;
+			this._currentThinkingId = null;
+			data = data.slice(endIdx + THINK_END.length);
+		}
+		return { emittedAny, remainingText };
+	}
+	private generateThinkingId(): string {
+		return `thinking_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+	}
 	private emitTextToolCallIfValid(
 		progress: Progress<LanguageModelResponsePart2>,
 		call: { name?: string; index?: number; argBuffer: string; emitted?: boolean },
@@ -711,122 +634,70 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		this.emitTextToolCallIfValid(progress, this._textToolActive, argText);
 		this._textToolActive = undefined;
 	}
-
-	private async tryEmitBufferedToolCall(index: number, progress: Progress<LanguageModelResponsePart2>): Promise<void> {
-		const buf = this._toolCallBuffers.get(index);
-		if (!buf || !buf.name) return;
-
-		const canParse = tryParseJSONObject(buf.args);
-		if (!canParse.ok) return;
-
-		const id = buf.id ?? `call_${Math.random().toString(36).slice(2, 10)}`;
-
-		// Encode signature into ID for persistence
-		let finalId = id;
-		if (buf.thoughtSignature) {
-			finalId = `${id}${GEMINI_SIG_SEPARATOR}${buf.thoughtSignature}`;
-		}
-
-		const parameters = canParse.value;
-		try {
-			const canonical = JSON.stringify(parameters);
-			this._emittedTextToolCallKeys.add(`${buf.name}:${canonical}`);
-		} catch { }
-
-		progress.report(new vscode.LanguageModelToolCallPart(finalId, buf.name, parameters));
-		this._toolCallBuffers.delete(index);
-		this._completedToolCallIndices.add(index);
-	}
-
-	private async flushToolCallBuffers(
-		progress: Progress<LanguageModelResponsePart2>,
-		throwOnInvalid: boolean
-	): Promise<void> {
-		if (this._toolCallBuffers.size === 0) return;
-
-		for (const [idx, buf] of Array.from(this._toolCallBuffers.entries())) {
-			const parsed = tryParseJSONObject(buf.args);
-			if (!parsed.ok) {
-				if (throwOnInvalid) {
-					console.error("[OAI Compatible Model Provider] Invalid JSON for tool call", {
-						idx,
-						snippet: (buf.args || "").slice(0, 200),
-					});
-					throw new Error("Invalid JSON for tool call");
-				}
-				continue;
-			}
-
-			const id = buf.id ?? `call_${Math.random().toString(36).slice(2, 10)}`;
-			const name = buf.name ?? "unknown_tool";
-
-			// Encode signature into ID for persistence
-			let finalId = id;
-			if (buf.thoughtSignature) {
-				finalId = `${id}${GEMINI_SIG_SEPARATOR}${buf.thoughtSignature}`;
-			}
-
-			try {
-				const canonical = JSON.stringify(parsed.value);
-				this._emittedTextToolCallKeys.add(`${name}:${canonical}`);
-			} catch { }
-
-			progress.report(new vscode.LanguageModelToolCallPart(finalId, name, parsed.value));
-			this._toolCallBuffers.delete(idx);
-			this._completedToolCallIndices.add(idx);
-		}
-	}
-
-	private processXmlThinkBlocks(
+	private processTextContent(
 		input: string,
 		progress: Progress<LanguageModelResponsePart2>
-	): { emittedAny: boolean; remainingText: string } {
-		if (this._xmlThinkDetectionAttempted && !this._xmlThinkActive) return { emittedAny: false, remainingText: input };
-
-		const THINK_START = "<think>";
-		const THINK_END = "</think>";
-		let data = input;
+	): { emittedText: boolean; emittedAny: boolean } {
+		let emittedText = false;
 		let emittedAny = false;
-		let remainingText = "";
+		const textToEmit = input;
+		if (textToEmit && textToEmit.length > 0) {
+			progress.report(new vscode.LanguageModelTextPart(textToEmit));
+			emittedText = true;
+			emittedAny = true;
+		}
+		return { emittedText, emittedAny };
+	}
 
-		while (data.length > 0) {
-			if (!this._xmlThinkActive) {
-				const startIdx = data.indexOf(THINK_START);
-				if (startIdx === -1) {
-					this._xmlThinkDetectionAttempted = true;
-					remainingText += data;
-					data = "";
-					break;
-				}
-				remainingText += data.slice(0, startIdx);
-				this._xmlThinkActive = true;
-				this._currentThinkingId = this.generateThinkingId();
-				data = data.slice(startIdx + THINK_START.length);
-				continue;
-			}
-
-			const endIdx = data.indexOf(THINK_END);
-			if (endIdx === -1) {
-				const thinkContent = data;
-				if (thinkContent) {
-					progress.report(new vscode.LanguageModelThinkingPart(thinkContent, this._currentThinkingId || undefined));
-					emittedAny = true;
-				}
-				data = "";
-				break;
-			}
-
-			const thinkContent = data.slice(0, endIdx);
-			if (thinkContent) {
-				progress.report(new vscode.LanguageModelThinkingPart(thinkContent, this._currentThinkingId || undefined));
-				emittedAny = true;
-			}
-
-			this._xmlThinkActive = false;
-			this._currentThinkingId = null;
-			data = data.slice(endIdx + THINK_END.length);
+	private tryEmitBufferedToolCall(
+		key: string,
+		progress: vscode.Progress<vscode.LanguageModelResponsePart2>,
+		isLast: boolean
+	) {
+		const buf = this._toolCallBuffers.get(key);
+		if (!buf || !buf.toolCall.function.name) {
+			return;
 		}
 
-		return { emittedAny, remainingText };
+		const canParseResult = tryParseJSONObject(buf.toolCall.function.arguments);
+		if (!canParseResult.ok && !isLast) {
+			// If we can't parse it, and it's not the last chunk, wait for more data.
+			return;
+		}
+
+		const id = buf.toolCall.id ?? `call_${Math.random().toString(36).slice(2, 10)}`;
+		const parameters = canParseResult.ok ? canParseResult.value : buf.toolCall.function.arguments;
+
+		if (canParseResult.ok) {
+			const canonical = JSON.stringify(parameters);
+			const toolKey = `${buf.toolCall.function.name}:${canonical}`;
+			if (this._emittedTextToolCallKeys.has(toolKey)) {
+				this._toolCallBuffers.delete(key);
+				return;
+			}
+			this._emittedTextToolCallKeys.add(toolKey);
+		}
+
+		// Emit the tool call with a clean ID.
+		progress.report(new vscode.LanguageModelToolCallPart(id, buf.toolCall.function.name, typeof parameters === 'string' ? {} : parameters));
+
+		this._toolCallBuffers.delete(key);
+	}
+
+	private flushToolCallBuffers(progress: vscode.Progress<vscode.LanguageModelResponsePart2>) {
+		if (this._toolCallBuffers.size === 0) return;
+
+		for (const key of this._toolCallBuffers.keys()) {
+			this.tryEmitBufferedToolCall(key, progress, true);
+		}
+	}
+
+	private async flushReasoningBuffer(progress: Progress<LanguageModelResponsePart2>): Promise<void> {
+		if (this._reasoningTextBuffer.length > 0) {
+			if (!this._currentThinkingId) this._currentThinkingId = this.generateThinkingId();
+			// Emit buffered text as a simple reasoning.text block
+			progress.report(new vscode.LanguageModelThinkingPart(this._reasoningTextBuffer, this._currentThinkingId, { type: "reasoning.text" }));
+			this._reasoningTextBuffer = "";
+		}
 	}
 }

@@ -592,3 +592,17 @@ export async function executeWithRetry<T>(
 	// This should never be reached, but TypeScript needs it
 	throw lastError || new Error("Retry failed");
 }
+
+/**
+ * Creates a simple, short hash from a string.
+ * Not cryptographically secure, but good enough for a unique cache key.
+ */
+export function shortHash(str: string): string {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = (hash << 5) - hash + char;
+    hash |= 0; // Convert to 32bit integer
+  }
+  return Math.abs(hash).toString(36);
+}

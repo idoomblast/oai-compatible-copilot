@@ -10,7 +10,9 @@
 			"type": "extensionHost",
 			"request": "launch",
 			"args": [
-				"--extensionDevelopmentPath=${workspaceFolder}"
+				"--extensionDevelopmentPath=${workspaceFolder}",
+				"--profile",
+				"Nextjs"
 			],
 			"outFiles": [
 				"${workspaceFolder}/out/**/*.js"

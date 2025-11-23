@@ -311,6 +311,7 @@
 	"scripts": {
 		"vscode:prepublish": "npm run compile",
 		"download-api": "dts dev && mv vscode.proposed.*.ts src",
+		"download-vsc-api": "dts 1.106.2 && mv vscode.dts.ts src",
 		"compile": "tsc -p ./",
 		"lint": "eslint",
 		"format": "prettier --write .",
