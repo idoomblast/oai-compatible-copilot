@@ -5,11 +5,13 @@
 
 // version: 4
 
-declare module "vscode" {
+declare module 'vscode' {
+
 	/**
-	 * The provider version of {@linkcode LanguageModelChatRequestOptions}
-	 */
+	* The provider version of {@linkcode LanguageModelChatRequestOptions}
+	*/
 	export interface ProvideLanguageModelChatResponseOptions {
+
 		/**
 		 * What extension initiated the request to the language model
 		 */
@@ -20,6 +22,7 @@ declare module "vscode" {
 	 * All the information representing a single language model contributed by a {@linkcode LanguageModelChatProvider}.
 	 */
 	export interface LanguageModelChatInformation {
+
 		/**
 		 * When present, this gates the use of `requestLanguageModelAccess` behind an authorization flow where
 		 * the user must approve of another extension accessing the models contributed by this extension.
@@ -72,18 +75,9 @@ declare module "vscode" {
 		readonly editTools?: string[];
 	}
 
-	export type LanguageModelResponsePart2 =
-		| LanguageModelResponsePart
-		| LanguageModelDataPart
-		| LanguageModelThinkingPart;
+	export type LanguageModelResponsePart2 = LanguageModelResponsePart | LanguageModelDataPart | LanguageModelThinkingPart;
 
 	export interface LanguageModelChatProvider<T extends LanguageModelChatInformation = LanguageModelChatInformation> {
-		provideLanguageModelChatResponse(
-			model: T,
-			messages: readonly LanguageModelChatRequestMessage[],
-			options: ProvideLanguageModelChatResponseOptions,
-			progress: Progress<LanguageModelResponsePart2>,
-			token: CancellationToken
-		): Thenable<void>;
+		provideLanguageModelChatResponse(model: T, messages: readonly LanguageModelChatRequestMessage[], options: ProvideLanguageModelChatResponseOptions, progress: Progress<LanguageModelResponsePart2>, token: CancellationToken): Thenable<void>;
 	}
 }

@@ -526,7 +526,8 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			let maybeThinking =
 				(choice as Record<string, unknown> | undefined)?.thinking ??
 				(deltaObj as Record<string, unknown> | undefined)?.thinking ??
-				(deltaObj as Record<string, unknown> | undefined)?.reasoning_content;
+				(deltaObj as Record<string, unknown> | undefined)?.reasoning_content ??
+				(deltaObj as Record<string, unknown> | undefined)?.reasoning;
 
 			const maybeReasoningDetails =
 				(deltaObj as Record<string, unknown>)?.reasoning_details ??
@@ -600,8 +601,10 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			const xmlRes = this.processXmlThinkBlocks(content, progress);
 			if (xmlRes.emittedAny) {
 				emitted = true;
-			} else {
-				const hasVisibleContent = content.trim().length > 0;
+			}
+
+			if (xmlRes.remainingText.length > 0) {
+				const hasVisibleContent = xmlRes.remainingText.trim().length > 0;
 				if (hasVisibleContent && this._currentThinkingId) {
 					try {
 						progress.report(new vscode.LanguageModelThinkingPart("", this._currentThinkingId));
@@ -609,7 +612,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 						this._currentThinkingId = null;
 					}
 				}
-				const res = this.processTextContent(content, progress);
+				const res = this.processTextContent(xmlRes.remainingText, progress);
 				if (res.emittedText) this._hasEmittedAssistantText = true;
 				if (res.emittedAny) emitted = true;
 			}
@@ -777,22 +780,25 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 	private processXmlThinkBlocks(
 		input: string,
 		progress: Progress<LanguageModelResponsePart2>
-	): { emittedAny: boolean } {
-		if (this._xmlThinkDetectionAttempted && !this._xmlThinkActive) return { emittedAny: false };
+	): { emittedAny: boolean; remainingText: string } {
+		if (this._xmlThinkDetectionAttempted && !this._xmlThinkActive) return { emittedAny: false, remainingText: input };
 
 		const THINK_START = "<think>";
 		const THINK_END = "</think>";
 		let data = input;
 		let emittedAny = false;
+		let remainingText = "";
 
 		while (data.length > 0) {
 			if (!this._xmlThinkActive) {
 				const startIdx = data.indexOf(THINK_START);
 				if (startIdx === -1) {
 					this._xmlThinkDetectionAttempted = true;
+					remainingText += data;
 					data = "";
 					break;
 				}
+				remainingText += data.slice(0, startIdx);
 				this._xmlThinkActive = true;
 				this._currentThinkingId = this.generateThinkingId();
 				data = data.slice(startIdx + THINK_START.length);
@@ -801,7 +807,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 
 			const endIdx = data.indexOf(THINK_END);
 			if (endIdx === -1) {
-				const thinkContent = data.trim();
+				const thinkContent = data;
 				if (thinkContent) {
 					progress.report(new vscode.LanguageModelThinkingPart(thinkContent, this._currentThinkingId || undefined));
 					emittedAny = true;
@@ -821,6 +827,6 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			data = data.slice(endIdx + THINK_END.length);
 		}
 
-		return { emittedAny };
+		return { emittedAny, remainingText };
 	}
 }
