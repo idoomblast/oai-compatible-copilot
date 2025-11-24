@@ -360,32 +360,47 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 				if (done) break;
 
 				buffer += decoder.decode(value, { stream: true });
+
 				const lines = buffer.split("\n");
+				// If the buffer ended with a newline, 'buffer' becomes empty.
+				// If it didn't, 'buffer' holds the incomplete line (potentially "data: [DONE]")
 				buffer = lines.pop() || "";
 
 				for (const line of lines) {
 					if (!line.startsWith("data:")) continue;
 					const data = line.slice(5).trim();
 					if (data === "[DONE]") {
-						await this.flushToolCallBuffers(progress);
-						await this.flushActiveTextToolCall(progress);
-						await this.flushReasoningBuffer(progress);
-						this.closeActiveThinking(progress);
+						await this.finishStream(progress);
 						return;
 					}
 					try {
 						await this.processDelta(JSON.parse(data), progress);
 					} catch (e) { }
 				}
+
+				// FIX: Check if the remaining buffer contains the [DONE] signal
+				// This handles cases where the server sends "data: [DONE]" as the very last bytes without a newline.
+				if (buffer.trim() === "data: [DONE]") {
+					await this.finishStream(progress);
+					return;
+				}
 			}
 		} finally {
+			// Ensure we close everything even if the stream ends abruptly or errors
 			this.closeActiveThinking(progress);
 			reader.releaseLock();
-			// Clean up
 			this._toolCallBuffers.clear();
 			this._currentThinkingId = null;
 			this._reasoningTextBuffer = "";
 		}
+	}
+
+	// Helper to centralize finish logic
+	private async finishStream(progress: Progress<LanguageModelResponsePart2>) {
+		await this.flushToolCallBuffers(progress);
+		await this.flushActiveTextToolCall(progress);
+		await this.flushReasoningBuffer(progress);
+		this.closeActiveThinking(progress);
 	}
 
 	private async processDelta(
@@ -559,16 +574,13 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		let emittedAny = false;
 		let remainingText = "";
 
-        // Optimization for simple text
-        if (this._xmlThinkDetectionAttempted && !this._xmlThinkActive) {
-            return { emittedAny: false, remainingText: input };
-        }
+		// REMOVED: The optimization check (this._xmlThinkDetectionAttempted) was too aggressive
+		// and could cause the extension to miss <think> tags if they arrived in the 2nd chunk.
 
 		while (data.length > 0) {
 			if (!this._xmlThinkActive) {
 				const startIdx = data.indexOf(THINK_START);
 				if (startIdx === -1) {
-                    this._xmlThinkDetectionAttempted = true;
 					remainingText += data;
 					data = "";
 					break;
@@ -583,7 +595,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 
 			const endIdx = data.indexOf(THINK_END);
 			if (endIdx === -1) {
-                if(!this._currentThinkingId) this._currentThinkingId = this.generateThinkingId();
+				if (!this._currentThinkingId) this._currentThinkingId = this.generateThinkingId();
 				progress.report(new vscode.LanguageModelThinkingPart(data, this._currentThinkingId));
 				emittedAny = true;
 				data = "";
@@ -591,10 +603,15 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			}
 
 			const content = data.slice(0, endIdx);
-            if(!this._currentThinkingId) this._currentThinkingId = this.generateThinkingId();
-			progress.report(new vscode.LanguageModelThinkingPart(content, this._currentThinkingId));
-			emittedAny = true;
+			if (!this._currentThinkingId) this._currentThinkingId = this.generateThinkingId();
 
+			// Emit the content
+			if (content.length > 0) {
+				progress.report(new vscode.LanguageModelThinkingPart(content, this._currentThinkingId));
+				emittedAny = true;
+			}
+
+			// Close the block
 			this._xmlThinkActive = false;
 			this.closeActiveThinking(progress);
 			data = data.slice(endIdx + THINK_END.length);
