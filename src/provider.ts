@@ -37,7 +37,7 @@ import axios from "axios";
 import { Readable } from "stream";
 
 // REDUCED LIMIT to prevent "Budget Exceeded" crash
-const MAX_TOOLS_PER_REQUEST = 40;
+const MAX_TOOLS_PER_REQUEST = 100;
 
 export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 	private readonly _toolCallBuffers: Map<string, {
@@ -370,7 +370,8 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 						await this.flushToolCallBuffers(progress);
 						await this.flushActiveTextToolCall(progress);
 						await this.flushReasoningBuffer(progress);
-						continue;
+						this.closeActiveThinking(progress);
+						return;
 					}
 					try {
 						await this.processDelta(JSON.parse(data), progress);
@@ -378,6 +379,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 				}
 			}
 		} finally {
+			this.closeActiveThinking(progress);
 			reader.releaseLock();
 			// Clean up
 			this._toolCallBuffers.clear();
@@ -594,7 +596,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			emittedAny = true;
 
 			this._xmlThinkActive = false;
-			this._currentThinkingId = null;
+			this.closeActiveThinking(progress);
 			data = data.slice(endIdx + THINK_END.length);
 		}
 		return { emittedAny, remainingText };
@@ -698,6 +700,18 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			// Emit buffered text as a simple reasoning.text block
 			progress.report(new vscode.LanguageModelThinkingPart(this._reasoningTextBuffer, this._currentThinkingId, { type: "reasoning.text" }));
 			this._reasoningTextBuffer = "";
+		}
+	}
+
+	private closeActiveThinking(progress: Progress<LanguageModelResponsePart2>) {
+		if (this._currentThinkingId) {
+			try {
+				progress.report(new vscode.LanguageModelThinkingPart("", this._currentThinkingId));
+			} catch (e) {
+				// Ignore errors if progress is already closed
+			} finally {
+				this._currentThinkingId = null;
+			}
 		}
 	}
 }

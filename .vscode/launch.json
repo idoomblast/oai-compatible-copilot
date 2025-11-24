@@ -9,6 +9,7 @@
 			"name": "Run Extension",
 			"type": "extensionHost",
 			"request": "launch",
+			"runtimeExecutable": "C:\\Users\\idoom\\AppData\\Local\\Programs\\Microsoft VS Code Insiders\\Code - Insiders.exe",
 			"args": [
 				"--extensionDevelopmentPath=${workspaceFolder}",
 				"--profile",
@@ -17,12 +18,13 @@
 			"outFiles": [
 				"${workspaceFolder}/out/**/*.js"
 			],
-			"preLaunchTask": "${defaultBuildTask}"
+			"preLaunchTask": "${defaultBuildTask}",
 		},
 		{
 			"name": "Extension Tests",
 			"type": "extensionHost",
 			"request": "launch",
+			"runtimeExecutable": "C:\\Users\\idoom\\AppData\\Local\\Programs\\Microsoft VS Code Insiders\\Code - Insiders.exe",
 			"args": [
 				"--extensionDevelopmentPath=${workspaceFolder}",
 				"--extensionTestsPath=${workspaceFolder}/out/test/suite/index"

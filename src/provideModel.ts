@@ -29,6 +29,10 @@ export async function prepareLanguageModelChatInformation(
 			const contextLen = m?.context_length ?? DEFAULT_CONTEXT_LENGTH;
 			const maxOutput = m?.max_completion_tokens ?? m?.max_tokens ?? DEFAULT_MAX_TOKENS;
 			const maxInput = Math.max(1, contextLen - maxOutput);
+			console.log("[OAI Compatible Model Provider] Using user-configured model:", m);
+			console.log(`[OAI Compatible Model Provider] contextLen: ${contextLen}`);
+			console.log(`[OAI Compatible Model Provider] minput: ${contextLen - maxOutput}`);
+			console.log(`[OAI Compatible Model Provider] Calculated maxInput: ${maxInput}, maxOutput: ${maxOutput}`);
 
 			// 使用配置ID（如果存在）来生成唯一的模型ID
 			const modelId = m.configId ? `${m.id}::${m.configId}` : m.id;
@@ -116,7 +120,7 @@ export async function prepareLanguageModelChatInformation(
 	}
 
 	// debug log
-	// console.log("[OAI Compatible Model Provider] Loaded models:", infos);
+	console.log("[OAI Compatible Model Provider] Loaded models:", infos);
 	return infos;
 }
 
