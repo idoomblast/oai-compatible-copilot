@@ -7,8 +7,6 @@ import {
 	ProvideLanguageModelChatResponseOptions,
 	LanguageModelResponsePart2,
 	Progress,
-	LanguageModelToolCallPart,
-	LanguageModelDataPart,
 } from "vscode";
 
 import type {
@@ -28,7 +26,6 @@ import {
 	parseModelId,
 	createRetryConfig,
 	executeWithRetry,
-	shortHash,
 } from "./utils";
 
 import { prepareLanguageModelChatInformation } from "./provideModel";
@@ -40,9 +37,9 @@ import { Readable } from "stream";
 const MAX_TOOLS_PER_REQUEST = 100;
 
 export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
-	private readonly _toolCallBuffers: Map<string, {
-        toolCall: OpenAIToolCall;
-    }> = new Map();
+	private readonly _toolCallBuffers = new Map<string, {
+		toolCall: OpenAIToolCall;
+	}>();
 	private _completedToolCallIndices = new Set<number>();
 	private _hasEmittedAssistantText = false;
 	private _emittedBeginToolCallsHint = false;
@@ -131,7 +128,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 
 		try {
 			// 2. SAFETY CHECK: Limit Tools to prevent "No lowest priority node" crash
-			let safeOptions = { ...options };
+			const safeOptions = { ...options };
 			if (safeOptions.tools && safeOptions.tools.length > MAX_TOOLS_PER_REQUEST) {
 				console.warn(`[OAI Provider] Too many tools (${safeOptions.tools.length}). Truncating to ${MAX_TOOLS_PER_REQUEST}.`);
 				safeOptions.tools = safeOptions.tools.slice(0, MAX_TOOLS_PER_REQUEST);
@@ -172,7 +169,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			requestBody = this.prepareRequestBody(requestBody, um, safeOptions);
 
 			const BASE_URL = um?.baseUrl || config.get<string>("oaicopilot.baseUrl", "");
-			if (!BASE_URL || !BASE_URL.startsWith("http")) throw new Error(`Invalid base URL.`);
+			if (!BASE_URL || !BASE_URL.startsWith("http")) {throw new Error(`Invalid base URL.`);}
 
 			const retryConfig = createRetryConfig();
 			const defaultHeaders: Record<string, string> = {
@@ -215,7 +212,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 					if (res.status < 200 || res.status >= 300) {
 						const stream = res.data;
 						const chunks: Buffer[] = [];
-						for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+						for await (const chunk of stream) {chunks.push(Buffer.from(chunk));}
 						const errorText = Buffer.concat(chunks).toString("utf-8");
 						throw new Error(`API error: [${res.status}] ${res.statusText} ${errorText}`);
 					}
@@ -225,7 +222,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 				token
 			);
 
-			if (!response.body) throw new Error("No response body");
+			if (!response.body) {throw new Error("No response body");}
 			await this.processStreamingResponse(response.body, trackingProgress, token);
 
 		} catch (err) {
@@ -243,9 +240,9 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		const oTopP = options.modelOptions?.top_p ?? 1;
 		rb.top_p = um?.top_p ?? oTopP;
 
-		if (um?.max_tokens) rb.max_tokens = um.max_tokens;
-		if (um?.max_completion_tokens) rb.max_completion_tokens = um.max_completion_tokens;
-		if (um?.reasoning_effort !== undefined) rb.reasoning_effort = um.reasoning_effort;
+		if (um?.max_tokens) {rb.max_tokens = um.max_tokens;}
+		if (um?.max_completion_tokens) {rb.max_completion_tokens = um.max_completion_tokens;}
+		if (um?.reasoning_effort !== undefined) {rb.reasoning_effort = um.reasoning_effort;}
 
 		const enableThinking = um?.enable_thinking;
 		if (enableThinking !== undefined) {
@@ -286,18 +283,18 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 
 		// Use the possibly-truncated tools from options
 		const toolConfig = convertTools(options);
-		if (toolConfig.tools) rb.tools = toolConfig.tools;
-		if (toolConfig.tool_choice) rb.tool_choice = toolConfig.tool_choice;
+		if (toolConfig.tools) {rb.tools = toolConfig.tools;}
+		if (toolConfig.tool_choice) {rb.tool_choice = toolConfig.tool_choice;}
 
-		if (um?.top_k !== undefined) rb.top_k = um.top_k;
-		if (um?.min_p !== undefined) rb.min_p = um.min_p;
-		if (um?.frequency_penalty !== undefined) rb.frequency_penalty = um.frequency_penalty;
-		if (um?.presence_penalty !== undefined) rb.presence_penalty = um.presence_penalty;
-		if (um?.repetition_penalty !== undefined) rb.repetition_penalty = um.repetition_penalty;
+		if (um?.top_k !== undefined) {rb.top_k = um.top_k;}
+		if (um?.min_p !== undefined) {rb.min_p = um.min_p;}
+		if (um?.frequency_penalty !== undefined) {rb.frequency_penalty = um.frequency_penalty;}
+		if (um?.presence_penalty !== undefined) {rb.presence_penalty = um.presence_penalty;}
+		if (um?.repetition_penalty !== undefined) {rb.repetition_penalty = um.repetition_penalty;}
 
 		if (um?.extra && typeof um.extra === "object") {
 			for (const [key, value] of Object.entries(um.extra)) {
-				if (value !== undefined) rb[key] = value;
+				if (value !== undefined) {rb[key] = value;}
 			}
 		}
 
@@ -305,7 +302,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 	}
 
 	// ... (Keep existing ensureApiKey) ...
-    private async ensureApiKey(useGenericKey: boolean, provider?: string): Promise<string | undefined> {
+	private async ensureApiKey(useGenericKey: boolean, provider?: string): Promise<string | undefined> {
 		let apiKey: string | undefined;
 		if (provider && provider.trim() !== "") {
 			const normalizedProvider = provider.toLowerCase();
@@ -357,7 +354,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		try {
 			while (!token.isCancellationRequested) {
 				const { done, value } = await reader.read();
-				if (done) break;
+				if (done) {break;}
 
 				buffer += decoder.decode(value, { stream: true });
 
@@ -367,7 +364,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 				buffer = lines.pop() || "";
 
 				for (const line of lines) {
-					if (!line.startsWith("data:")) continue;
+					if (!line.startsWith("data:")) {continue;}
 					const data = line.slice(5).trim();
 					if (data === "[DONE]") {
 						await this.finishStream(progress);
@@ -409,7 +406,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 	): Promise<boolean> {
 		let emitted = false;
 		const choice = (delta.choices as Record<string, unknown>[] | undefined)?.[0];
-		if (!choice) return false;
+		if (!choice) {return false;}
 
 		const deltaObj = choice.delta as Record<string, unknown> | undefined;
 
@@ -472,7 +469,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 
 						// 2. Emit this chunk immediately with its metadata/signature.
 						if (text || signature) {
-							if (!this._currentThinkingId) this._currentThinkingId = this.generateThinkingId();
+							if (!this._currentThinkingId) {this._currentThinkingId = this.generateThinkingId();}
 							const metadata: Record<string, any> = { format: detail.format, type: detail.type, index: detail.index };
 
 							// IMPORTANT: Include signature in metadata so it can be round-tripped in history.
@@ -491,15 +488,49 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			if (maybeThinking !== undefined && maybeThinking !== null) {
 				let text = "";
 				let metadata: Record<string, unknown> | undefined;
+
 				if (maybeThinking && typeof maybeThinking === "object") {
 					const mt = maybeThinking as Record<string, unknown>;
-					text = typeof mt["text"] === "string" ? (mt["text"] as string) : JSON.stringify(mt);
+
+					// --- CLEAN UP LOGIC FOR STRUCTURED THINKING ---
+					// If the thought object contains a function call, format it nicely instead of dumping JSON.
+					if (mt.functionCall || (mt.type === 'function_call')) {
+						const fc = (mt.functionCall as any) || mt;
+						const name = fc.name || "tool";
+						text = `Invoking tool: ${name}`;
+					} else if (mt.args || mt.arguments) {
+						// If it's just arguments, suppress it or show a simple indicator
+						text = ""; // or "..."
+					} else {
+						// Default fallback
+						text = typeof mt["text"] === "string" ? (mt["text"] as string) : JSON.stringify(mt);
+					}
+					// -----------------------------------------------
+
 					metadata = mt["metadata"] ? (mt["metadata"] as Record<string, unknown>) : undefined;
 				} else if (typeof maybeThinking === "string") {
-					text = maybeThinking;
+					// --- CLEAN UP LOGIC FOR STRINGIFIED JSON ---
+					const trimmed = maybeThinking.trim();
+					if (trimmed.startsWith('{"functionCall":') || trimmed.startsWith('{"type":"function_call"')) {
+						try {
+							const parsed = JSON.parse(trimmed);
+							const fc = parsed.functionCall || parsed;
+							if (fc && fc.name) {
+								text = `Invoking tool: ${fc.name}`;
+							} else {
+								text = trimmed;
+							}
+						} catch {
+							text = maybeThinking;
+						}
+					} else {
+						text = maybeThinking;
+					}
+					// --------------------------------------------
 				}
+
 				if (text) {
-					if (!this._currentThinkingId) this._currentThinkingId = this.generateThinkingId();
+					if (!this._currentThinkingId) {this._currentThinkingId = this.generateThinkingId();}
 					progress.report(new vscode.LanguageModelThinkingPart(text, this._currentThinkingId, metadata));
 					emitted = true;
 				}
@@ -526,8 +557,8 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 					}
 				}
 				const res = this.processTextContent(xmlRes.remainingText, progress);
-				if (res.emittedText) this._hasEmittedAssistantText = true;
-				if (res.emittedAny) emitted = true;
+				if (res.emittedText) {this._hasEmittedAssistantText = true;}
+				if (res.emittedAny) {emitted = true;}
 			}
 		}
 
@@ -535,7 +566,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			const { tool_calls } = deltaObj;
 			if (tool_calls) {
 				for (const tc of tool_calls as any[]) {
-					if (!tc) continue;
+					if (!tc) {continue;}
 					const { id, function: func, "x-provider": providerFields } = tc;
 					let buf = this._toolCallBuffers.get(id ?? "");
 					if (!buf) {
@@ -544,8 +575,8 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 							this._toolCallBuffers.set(id, buf);
 						}
 					}
-					if (func?.name) buf.toolCall.function.name += func.name;
-					if (func?.arguments) buf.toolCall.function.arguments += func.arguments;
+					if (func?.name) {buf.toolCall.function.name += func.name;}
+					if (func?.arguments) {buf.toolCall.function.arguments += func.arguments;}
 
 					if (providerFields?.thought) {
 						progress.report(new vscode.LanguageModelToolCallPart(id ?? "", id ?? "", { thought: providerFields.thought }));
@@ -595,7 +626,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 
 			const endIdx = data.indexOf(THINK_END);
 			if (endIdx === -1) {
-				if (!this._currentThinkingId) this._currentThinkingId = this.generateThinkingId();
+				if (!this._currentThinkingId) {this._currentThinkingId = this.generateThinkingId();}
 				progress.report(new vscode.LanguageModelThinkingPart(data, this._currentThinkingId));
 				emittedAny = true;
 				data = "";
@@ -603,7 +634,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			}
 
 			const content = data.slice(0, endIdx);
-			if (!this._currentThinkingId) this._currentThinkingId = this.generateThinkingId();
+			if (!this._currentThinkingId) {this._currentThinkingId = this.generateThinkingId();}
 
 			// Emit the content
 			if (content.length > 0) {
@@ -628,13 +659,13 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 	): boolean {
 		const name = call.name ?? "unknown_tool";
 		const parsed = tryParseJSONObject(argText);
-		if (!parsed.ok) return false;
+		if (!parsed.ok) {return false;}
 
 		const canonical = JSON.stringify(parsed.value);
 		const key = `${name}:${canonical}`;
 		if (typeof call.index === "number") {
 			const idKey = `${name}:${call.index}`;
-			if (this._emittedTextToolCallIds.has(idKey)) return false;
+			if (this._emittedTextToolCallIds.has(idKey)) {return false;}
 			this._emittedTextToolCallIds.add(idKey);
 		} else if (this._emittedTextToolCallKeys.has(key)) {
 			return false;
@@ -646,10 +677,10 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 	}
 
 	private async flushActiveTextToolCall(progress: Progress<LanguageModelResponsePart2>): Promise<void> {
-		if (!this._textToolActive) return;
+		if (!this._textToolActive) {return;}
 		const argText = this._textToolActive.argBuffer;
 		const parsed = tryParseJSONObject(argText);
-		if (!parsed.ok) return;
+		if (!parsed.ok) {return;}
 		this.emitTextToolCallIfValid(progress, this._textToolActive, argText);
 		this._textToolActive = undefined;
 	}
@@ -704,7 +735,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 	}
 
 	private flushToolCallBuffers(progress: vscode.Progress<vscode.LanguageModelResponsePart2>) {
-		if (this._toolCallBuffers.size === 0) return;
+		if (this._toolCallBuffers.size === 0) {return;}
 
 		for (const key of this._toolCallBuffers.keys()) {
 			this.tryEmitBufferedToolCall(key, progress, true);
@@ -713,7 +744,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 
 	private async flushReasoningBuffer(progress: Progress<LanguageModelResponsePart2>): Promise<void> {
 		if (this._reasoningTextBuffer.length > 0) {
-			if (!this._currentThinkingId) this._currentThinkingId = this.generateThinkingId();
+			if (!this._currentThinkingId) {this._currentThinkingId = this.generateThinkingId();}
 			// Emit buffered text as a simple reasoning.text block
 			progress.report(new vscode.LanguageModelThinkingPart(this._reasoningTextBuffer, this._currentThinkingId, { type: "reasoning.text" }));
 			this._reasoningTextBuffer = "";
@@ -724,7 +755,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		if (this._currentThinkingId) {
 			try {
 				progress.report(new vscode.LanguageModelThinkingPart("", this._currentThinkingId));
-			} catch (e) {
+			} catch (e: any) {
 				// Ignore errors if progress is already closed
 			} finally {
 				this._currentThinkingId = null;
