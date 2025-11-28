@@ -30,6 +30,7 @@ import {
 
 import { prepareLanguageModelChatInformation } from "./provideModel";
 import { prepareTokenCount } from "./provideToken";
+import { KimiToolStreamingParser } from "./kimiToolParser";
 import axios from "axios";
 import { Readable } from "stream";
 
@@ -41,6 +42,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		toolCall: OpenAIToolCall;
 	}>();
 	private _completedToolCallIndices = new Set<number>();
+	private _kimiParser: KimiToolStreamingParser | undefined;
 	private _hasEmittedAssistantText = false;
 	private _emittedBeginToolCallsHint = false;
 	private _textToolActive: undefined | { name?: string; index?: number; argBuffer: string; emitted?: boolean };
@@ -91,6 +93,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		// Reset state
 		this._toolCallBuffers.clear();
 		this._completedToolCallIndices.clear();
+		this._kimiParser = new KimiToolStreamingParser();
 		this._hasEmittedAssistantText = false;
 		this._emittedBeginToolCallsHint = false;
 		this._textToolActive = undefined;
@@ -374,7 +377,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 					}
 					try {
 						await this.processDelta(JSON.parse(data), progress);
-					} catch (e) { }
+					} catch { /* empty */ }
 				}
 
 				// FIX: Check if the remaining buffer contains the [DONE] signal
@@ -400,6 +403,18 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		await this.flushToolCallBuffers(progress);
 		await this.flushActiveTextToolCall(progress);
 		await this.flushReasoningBuffer(progress);
+		if (this._kimiParser) {
+			const results = this._kimiParser.flush();
+			for (const res of results) {
+				if (res.type === "thinking" && res.content) {
+					const t = this.cleanThinkingString(res.content);
+					if (t) {
+						if (!this._currentThinkingId) {this._currentThinkingId = this.generateThinkingId();}
+						progress.report(new vscode.LanguageModelThinkingPart(t, this._currentThinkingId));
+					}
+				}
+			}
+		}
 		this.closeActiveThinking(progress);
 	}
 
@@ -512,24 +527,30 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 
 					metadata = mt["metadata"] ? (mt["metadata"] as Record<string, unknown>) : undefined;
 				} else if (typeof maybeThinking === "string") {
-					// --- CLEAN UP LOGIC FOR STRINGIFIED JSON ---
-					const trimmed = maybeThinking.trim();
-					if (trimmed.startsWith('{"functionCall":') || trimmed.startsWith('{"type":"function_call"')) {
-						try {
-							const parsed = JSON.parse(trimmed);
-							const fc = parsed.functionCall || parsed;
-							if (fc && fc.name) {
-								text = `Invoking tool: ${fc.name}`;
-							} else {
-								text = trimmed;
+					if (this._kimiParser) {
+						const results = this._kimiParser.processChunk(maybeThinking);
+						for (const res of results) {
+							if (res.type === "thinking" && res.content) {
+								const t = this.cleanThinkingString(res.content);
+								if (t) {
+									if (!this._currentThinkingId) {this._currentThinkingId = this.generateThinkingId();}
+									progress.report(new vscode.LanguageModelThinkingPart(t, this._currentThinkingId, metadata));
+									emitted = true;
+								}
+							} else if (res.type === "tool" && res.toolCall) {
+								const toolId = `call_${Math.random().toString(36).slice(2, 10)}`;
+								let args: Record<string, any> = {};
+								try {
+									args = JSON.parse(res.toolCall.arguments);
+								} catch { /* empty */ }
+								progress.report(new vscode.LanguageModelToolCallPart(toolId, res.toolCall.name, args));
+								emitted = true;
 							}
-						} catch {
-							text = maybeThinking;
 						}
 					} else {
-						text = maybeThinking;
+						// Fallback Logic
+						text = this.cleanThinkingString(maybeThinking);
 					}
-					// --------------------------------------------
 				}
 
 				if (text) {
@@ -555,7 +576,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 				if (hasVisibleContent && this._currentThinkingId) {
 					try {
 						progress.report(new vscode.LanguageModelThinkingPart("", this._currentThinkingId));
-					} catch (e) { } finally {
+					} catch { /* empty */ } finally {
 						this._currentThinkingId = null;
 					}
 				}
@@ -772,11 +793,25 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		if (this._currentThinkingId) {
 			try {
 				progress.report(new vscode.LanguageModelThinkingPart("", this._currentThinkingId));
-			} catch (e: any) {
+			} catch {
 				// Ignore errors if progress is already closed
 			} finally {
 				this._currentThinkingId = null;
 			}
 		}
+	}
+
+	private cleanThinkingString(input: string): string {
+		const trimmed = input.trim();
+		if (trimmed.startsWith('{"functionCall":') || trimmed.startsWith('{"type":"function_call"')) {
+			try {
+				const parsed = JSON.parse(trimmed);
+				const fc = parsed.functionCall || parsed;
+				if (fc && fc.name) {
+					return `Invoking tool: ${fc.name}`;
+				}
+			} catch { /* empty */ }
+		}
+		return input;
 	}
 }
