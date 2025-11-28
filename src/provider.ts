@@ -46,6 +46,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 	private _textToolActive: undefined | { name?: string; index?: number; argBuffer: string; emitted?: boolean };
 	private _emittedTextToolCallKeys = new Set<string>();
 	private _emittedTextToolCallIds = new Set<string>();
+	private _activeToolCallIdByIndex = new Map<number, string>();
 	private _xmlThinkActive = false;
 	private _xmlThinkDetectionAttempted = false;
 	private _currentThinkingId: string | null = null;
@@ -95,6 +96,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		this._textToolActive = undefined;
 		this._emittedTextToolCallKeys.clear();
 		this._emittedTextToolCallIds.clear();
+		this._activeToolCallIdByIndex.clear();
 		this._xmlThinkActive = false;
 		this._xmlThinkDetectionAttempted = false;
 		this._currentThinkingId = null;
@@ -387,6 +389,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			this.closeActiveThinking(progress);
 			reader.releaseLock();
 			this._toolCallBuffers.clear();
+			this._activeToolCallIdByIndex.clear();
 			this._currentThinkingId = null;
 			this._reasoningTextBuffer = "";
 		}
@@ -566,20 +569,34 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			const { tool_calls } = deltaObj;
 			if (tool_calls) {
 				for (const tc of tool_calls as any[]) {
-					if (!tc) {continue;}
+					if (!tc) { continue; }
+					const index = tc.index ?? 0;
 					const { id, function: func, "x-provider": providerFields } = tc;
-					let buf = this._toolCallBuffers.get(id ?? "");
-					if (!buf) {
-						buf = { toolCall: { id: id ?? "", type: "function", function: { name: "", arguments: "" } } };
-						if (id) {
-							this._toolCallBuffers.set(id, buf);
-						}
+
+					let resolvedId = id;
+					if (resolvedId) {
+						this._activeToolCallIdByIndex.set(index, resolvedId);
+					} else {
+						resolvedId = this._activeToolCallIdByIndex.get(index);
 					}
-					if (func?.name) {buf.toolCall.function.name += func.name;}
-					if (func?.arguments) {buf.toolCall.function.arguments += func.arguments;}
+
+					// If we still don't have an ID, likely a malformed stream or we missed the first chunk.
+					// For robustness, if we have a name but no ID, we could generate one, but that risks splitting buffers.
+					// We'll skip if no ID can be resolved.
+					if (!resolvedId) {
+						continue;
+					}
+
+					let buf = this._toolCallBuffers.get(resolvedId);
+					if (!buf) {
+						buf = { toolCall: { id: resolvedId, type: "function", function: { name: "", arguments: "" } } };
+						this._toolCallBuffers.set(resolvedId, buf);
+					}
+					if (func?.name) { buf.toolCall.function.name += func.name; }
+					if (func?.arguments) { buf.toolCall.function.arguments += func.arguments; }
 
 					if (providerFields?.thought) {
-						progress.report(new vscode.LanguageModelToolCallPart(id ?? "", id ?? "", { thought: providerFields.thought }));
+						progress.report(new vscode.LanguageModelToolCallPart(resolvedId, resolvedId, { thought: providerFields.thought }));
 						emitted = true;
 					}
 				}
