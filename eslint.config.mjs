@@ -43,7 +43,8 @@ export default tseslint.config(
 				{
 					'argsIgnorePattern': '^_'
 				}
-			]
+			],
+			"@typescript-eslint/no-explicit-any": "off"
 		}
 	}
 );
